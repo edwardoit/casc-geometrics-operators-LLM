@@ -4,7 +4,7 @@ CASC is an autoregressive language model built as a cascade of learned geometric
 repository publishes the trained 175M-parameter checkpoint CASC-NTP A (NTP_A_4B) with its results as they
 were produced, together with the code that trained it and the theory behind the architecture.
 
-## The idea
+## The idea - ONLY a study case to LLM comprehension
 
 <p align="center"><img src="docs/casc_diagram.png" alt="CASC: seven operators in cascade" width="560"></p>
 
