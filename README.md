@@ -238,6 +238,67 @@ independently and compared. Tokenizer, packing, training with context extension 
 data parallelism on CPU, and the three inference modes run end to end. The six-GPU NCCL launch itself
 needs GPUs and is not part of the suite.
 
+## Next steps
+
+The current CASC implementation applies its learned geometric operators vector-wise to latent representations. The next experiment will investigate whether the same cascade can operate on an explicitly learned representation manifold, deforming the underlying geometric space while preserving the corresponding transformation of its projected points.
+
+Proposed Architecture
+
+CURRENT CASC — implemented and evaluated
+
+latent vector x
+   │
+   ▼
+   F → B → M → M → V → M → S
+   │  sequential vector-wise transformations
+   ▼
+   updated hidden representation
+   │
+   ▼
+   readout → softmax → observable
+
+
+FUTURE CASC — experimental hypothesis
+
+learned latent vectors x
+   │
+   │  Pi_in: projection into a shared learned space
+   ▼
+   M_0 ⊂ R^D                  initial representation manifold //same object in high dimensional space deformed into unique way the main hypothesis
+   │
+   │  p_0 = Pi_in(x)          projected representation
+   ▼
+   for k = 1..7, families F B M M V M S:
+
+       field_k = Operator_k(M_k, context)
+       M_(k+1) = Deform(M_k, field_k)
+       p_(k+1) = Transport(p_k, M_k → M_(k+1))
+
+       the next operator acts on the updated geometry
+
+   │
+   ▼
+   M_7, p_7                  deformed manifold and transported point
+   │
+   │  Pi_out: projection back into hidden space
+   ▼
+   reconstructed hidden representation
+   │
+   ▼
+   RMSNorm → E^T → softmax → observable
+
+
+
+The experiment aims to determine whether the same CASC operator cascade, applied as successive deformations of a learned geometric space, can reproduce the corresponding vector-wise transformations while providing a more expressive representation geometry.
+
+The existing recurrent memory, attention mechanisms, operator ordering, and decoding architecture are preserved.
+
+Current: learned transformations of individual latent vectors.
+
+Next experiment: projection of latent representations onto a learned manifold, successive manifold deformations, consistent transport of the projected points, and projection back to obtain the final observable.
+
+
+
 ## License
 
 GNU General Public License v3.0, see [LICENSE](LICENSE).
