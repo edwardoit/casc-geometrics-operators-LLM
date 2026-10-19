@@ -1,0 +1,657 @@
+% Build: pdflatex Architecture.tex, twice (table of contents).
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{parskip}
+\setlength{\emergencystretch}{2em}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs,array}
+\usepackage[a4paper,margin=25mm,headheight=14pt]{geometry}
+\usepackage{fancyhdr}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black,citecolor=blue!55!black]{hyperref}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{CASC--NTP \textbullet{} Configuration A}
+\rhead{Mathematical architecture}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\rmsn}{\operatorname{RMSNorm}}
+\newcommand{\SiLU}{\operatorname{SiLU}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\gbar}{\bar g}
+\newcommand{\Gbar}{\bar G}
+\newcommand{\up}{{\uparrow}}
+\newcommand{\dn}{{\downarrow}}
+\newcommand{\one}{\mathbf{1}}
+\newcommand{\op}{\operatorname{op}}
+\newcommand{\T}{\top}
+
+\title{\textbf{CASC--NTP}\\[6pt]
+\large Mathematical Architecture of the Geometric Cascade Machine\\[2pt]
+\normalsize Configuration A: $F$--$B$--$M$--$M$--$V$--$M$--$S$}
+\author{CASC Project}
+\date{Architecture specification \textbullet{} October 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{plain}
+
+\begin{abstract}
+CASC--NTP is an autoregressive neural architecture with a recurrent causal carrier, a communication
+attention mechanism, a separate control attention mechanism, and a sequence of learned low-rank
+geometric operators. Each operator stage acts in a lifted operational space but returns its update to
+the hidden state before the next stage is evaluated. The next stage therefore conditions on the
+representation already transformed by previous stages. This document specifies the \emph{machine
+itself}: its parameterization, tensor dimensions, recurrence, routing simplices, operator families,
+composition law, and lexical readout. A final section records the optimization mechanism used in the
+documented implementation: standard reverse-mode automatic differentiation (backpropagation) of
+next-token cross-entropy, followed by AdamW.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================================================
+\section{Scope and mathematical conventions}
+
+The specified machine is \textbf{CASC--NTP, Configuration A}. It has four structurally identical blocks
+with independent trainable parameters. Each block processes a causal sequence, communicates recurrent
+memory into the hidden state, then applies seven consecutive geometric updates of families
+\begin{equation}\label{eq:families}
+(f_1,\dots,f_7)=(F,B,M,M,V,M,S).
+\end{equation}
+The order is architectural: the three occurrences of $M$ have their own operator parameters and cannot
+be treated as one shared metric operator.
+
+Throughout, activations are \emph{row vectors}; learned matrices multiply on the right. The position
+index is $i\in\{1,\dots,L\}$, block index is $b\in\{1,\dots,S\}$, geometric stage is
+$k\in\{1,\dots,K\}$, head index is $a\in\{1,\dots,H\}$, and operator slot is $j\in\{0,\dots,5\}$.
+Unless otherwise specified, all formulas for a block omit the superscript $(b)$ to keep the notation
+readable. Operators and parameters in distinct blocks are independent.
+
+\subsection{Dimensions}
+
+\begin{center}
+\begin{tabular}{p{0.15\textwidth}p{0.47\textwidth}r}
+\toprule
+Symbol & Meaning & Configuration A\\
+\midrule
+$V$ & Vocabulary size & 64{,}000\\
+$d_x$ & Hidden and lexical embedding width & 1{,}024\\
+$d_g$ & Recurrent carrier / attention width & 512\\
+$H$ & Number of heads in each attention & 8\\
+$d_h$ & Width of each attention head ($Hd_h=d_g$) & 64\\
+$D$ & Lifted operational dimension & 4{,}096\\
+$r$ & Local operator rank & 32\\
+$K$ & Geometric stages per block & 7\\
+$S$ & Independent blocks & 4\\
+$L$ & Causal sequence length & Configurable\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Sequence length $L$ is \emph{not} fixed by the architecture. The training code defaults to $L=512$. The published run used $L=96$ for its initial training phase and an extension to $L=384$ near the end. These are protocol choices, not different definitions of the
+machine.
+
+\subsection{Elementary functions and normalizations}
+
+For scalar or elementwise arguments, define
+\begin{equation}
+\sigma(t)=\frac{1}{1+e^{-t}},\qquad \softplus(t)=\log(1+e^{t}),\qquad \SiLU(t)=t\sigma(t).
+\end{equation}
+Hadamard multiplication is written $\odot$. The numerical stabilization constant is $\varepsilon=10^{-6}$.
+For $x\in\R^d$, the parameter-free root-mean-square normalization is
+\begin{equation}
+\operatorname{rms}(x)=\frac{x}{\sqrt{\|x\|_2^2/d+\varepsilon}}.
+\end{equation}
+The trainable version uses a learned coordinatewise gain $\gamma\in\R^d$:
+\begin{equation}
+\rmsn_d(x)=\gamma\odot\operatorname{rms}(x).
+\end{equation}
+Different uses of RMSNorm have their own scale parameters unless parameter sharing is explicitly
+specified. We use
+\begin{equation}
+\Delta^{n-1}=\Bigl\{\alpha\in\R^n_{\ge 0}:\ \sum_{j=1}^{n}\alpha_j=1\Bigr\}
+\end{equation}
+for the $(n-1)$-dimensional probability simplex.
+
+% =====================================================================================================
+\section{Lexical interface and block composition}
+
+Let $y_1,\dots,y_L\in\{0,\dots,V-1\}$ be token indices. The trainable embedding is
+\begin{equation}
+E\in\R^{V\times d_x},\qquad E_{q\ell}\sim\mathcal N(0,0.02^2),\qquad x_i^{[0]}=E[y_i]\in\R^{d_x}.
+\end{equation}
+The same matrix is used by the final language-model head (weight tying).
+
+With $B_b$ denoting the complete transformation performed by block $b$, the machine body is
+\begin{equation}
+x^{[S]}=B_S\circ B_{S-1}\circ\cdots\circ B_1\bigl(x^{[0]}\bigr),\qquad S=4.
+\end{equation}
+Every block is internally divided into a \emph{recurrent memory construction}, a \emph{causal
+communication read}, and a \emph{seven-stage controlled geometric cascade}. Shared parameters are
+shared \emph{across the seven stages within a block}, not between distinct blocks.
+
+% =====================================================================================================
+\section{Causal memory: signed-simplex GRU}
+
+\subsection{Memory input and recurrent gates}
+
+At position $i$ of a fixed block, write $x_i\in\R^{d_x}$ for the block input. Project it into the
+carrier width:
+\begin{equation}
+e_i=\rmsn_{d_x}(x_i)P_G\in\R^{d_g},\quad P_G\in\R^{d_x\times d_g},\quad \gbar_0=0.
+\end{equation}
+$P_G$ has no bias. The reset gate differs from the usual sigmoid GRU reset: it uses softplus and may
+therefore exceed one. With $W_r,W_z,W_h,U_r,U_z,U_h\in\R^{d_g\times d_g}$ and $b_r,b_z,b_h\in\R^{d_g}$,
+\begin{align}
+r_i&=\softplus(e_iW_r+\gbar_{i-1}U_r+b_r), && r_i\in(0,\infty)^{d_g},\\
+z_i&=\sigma(e_iW_z+\gbar_{i-1}U_z+b_z), && z_i\in(0,1)^{d_g},\\
+h_i^{\mathrm{GRU}}&=\tanh\bigl(e_iW_h+(r_i\odot\gbar_{i-1})U_h+b_h\bigr),\\
+g_i^{\mathrm{raw}}&=(\one-z_i)\odot\gbar_{i-1}+z_i\odot h_i^{\mathrm{GRU}}.
+\end{align}
+The symbol $h_i^{\mathrm{GRU}}$ is the recurrent candidate, not the geometric-stage hidden state
+introduced below.
+
+\subsection{Signed-simplex factorization}
+
+The raw recurrence is converted into an oriented, normalized memory representation. Let
+$\beta_{\mathrm{mem}}$ and $\kappa_{\mathrm{mem}}$ denote the learnable scalars named $\beta$ and $\kappa$ in the code. Set, coordinatewise,
+\begin{align}
+s_i&=\tanh\bigl(\beta_{\mathrm{mem}}g_i^{\mathrm{raw}}\bigr), && s_i\in(-1,1)^{d_g},\\
+m_{ij}&=\sqrt{(g_{ij}^{\mathrm{raw}})^2+\varepsilon},\\
+q_{ij}&=\softplus(\kappa_{\mathrm{mem}}m_{ij})>0,\\
+\alpha_{ij}&=\frac{q_{ij}}{\sum_{\ell=1}^{d_g}q_{i\ell}}, && \alpha_i\in\Delta^{d_g-1},\\
+g_i&=s_i\odot\alpha_i.
+\end{align}
+Thus the magnitude allocation $\alpha_i$ is a simplex, whereas $g_i$ is a \emph{signed simplex-weighted
+vector}; $g_i$ is not itself a probability vector. Since $|s_{ij}|<1$,
+\begin{equation}
+\|g_i\|_1=\sum_j|s_{ij}|\alpha_{ij}<\sum_j\alpha_{ij}=1.
+\end{equation}
+The entropy and corresponding effective number of active coordinates are descriptive diagnostics:
+\begin{equation}
+\mathcal H(\alpha_i)=-\sum_{j=1}^{d_g}\alpha_{ij}\log\alpha_{ij},\qquad
+N_{\mathrm{eff}}(\alpha_i)=e^{\mathcal H(\alpha_i)}.
+\end{equation}
+
+\subsection{Carrier propagated through time}
+
+The recurrent carrier used by the next step and by the communication attention is
+\begin{equation}
+\gbar_i=\gamma_c\odot\operatorname{rms}(g_i),\qquad \gamma_c\in\R^{d_g}\ \ \text{learnable and specific to the block.}
+\end{equation}
+The coordinatewise gain $\gamma_c$ is the learned gain of the carrier; the documented NOSCAL architecture
+does not insert additional scalar gates on the two large residual paths of the block. The causal
+recurrent computation at position $i$ depends on positions $\le i$ only.
+
+% =====================================================================================================
+\section{Communication attention: reading the causal carrier}\label{sec:attention}
+
+Collect the carrier vectors into a matrix:
+\begin{equation}
+\Gbar=\begin{bmatrix}\gbar_1\\ \vdots\\ \gbar_L\end{bmatrix}\in\R^{L\times d_g}.
+\end{equation}
+Three learned projections generate multihead queries, keys and values:
+\begin{equation}
+Q^A=\Gbar W_Q^A,\qquad K^A=\Gbar W_K^A,\qquad V^A=\Gbar W_V^A,\quad W_Q^A,W_K^A,W_V^A\in\R^{d_g\times d_g}.
+\end{equation}
+Each of the $H=8$ heads has $d_h=64$ coordinates. For head $a$, use $q_i^a,k_i^a,v_i^a\in\R^{d_h}$ for
+its partition of $Q^A,K^A,V^A$.
+
+\subsection{Rotary position embedding (RoPE)}
+
+For positions $i$, RoPE applies a block diagonal matrix containing $d_h/2$ two-dimensional rotations,
+with frequencies
+\begin{gather}
+\omega_p=10000^{-2p/d_h},\qquad p=0,\dots,d_h/2-1,\\
+R_i=\bigoplus_{p=0}^{d_h/2-1}\begin{bmatrix}\cos(i\omega_p)&-\sin(i\omega_p)\\ \sin(i\omega_p)&\cos(i\omega_p)\end{bmatrix}.
+\end{gather}
+Equivalently, for row-vector convention, the rotated queries and keys are written
+$\tilde q_i^a=q_i^aR_i^{\T}$ and $\tilde k_i^a=k_i^aR_i^{\T}$. The rotation is applied to queries and
+keys, not to values.
+
+\subsection{Masked attention and communication residual}
+
+For every attention head $a$, the causal scores and simplex weights are
+\begin{gather}
+S_{ij}^{A,a}=\begin{cases}\dfrac{\tau_{A,a}}{\sqrt{d_h}}\,\langle\tilde q_i^a,\tilde k_j^a\rangle, & j\le i,\\[4pt] -\infty, & j>i,\end{cases}\\
+\rho_{ij}^{A,a}=\frac{\exp S_{ij}^{A,a}}{\sum_{\ell\le i}\exp S_{i\ell}^{A,a}},\qquad
+\bigl(\rho_{i1}^{A,a},\dots,\rho_{ii}^{A,a}\bigr)\in\Delta^{i-1}.
+\end{gather}
+The notation $\rho^{A,a}$ is used for attention weights to avoid confusing them with the learned memory
+scalar $\beta_{\mathrm{mem}}$. Here $\tau_{A,a}$ is the learned head-specific score factor.
+
+Concatenate the eight weighted reads:
+\begin{equation}
+c_i^A=\operatorname*{concat}_{a=1}^{H}\Bigl(\sum_{j\le i}\rho_{ij}^{A,a}v_j^a\Bigr)\in\R^{d_g}.
+\end{equation}
+Communication updates the hidden representation by
+\begin{equation}
+x_i^{+}=x_i+c_i^AW_O,\qquad W_O\in\R^{d_g\times d_x},\qquad (W_O)_{pq}\sim\mathcal N(0,0.02^2).
+\end{equation}
+There is no extra learned scalar multiplier on this residual. This is the documented NOSCAL
+communication path.
+
+% =====================================================================================================
+\section{Stage-wise control: a second causal attention}
+
+The control mechanism $C$ is \emph{separate} from communication attention $A$: it has its own learned
+query, key and value projections, also with $H=8$ heads of width $d_h=64$, RoPE and causal masking. It is
+used to determine operator-mixture coefficients rather than the communicated residual.
+
+Crucially, $C$ is recomputed \emph{at every geometric stage} on the currently transformed hidden
+sequence. If $x_i^{(k-1)}$ is the hidden state entering stage $k$, define
+\begin{equation}
+h_{k,i}=\rmsn_{d_x}\Bigl(x_i^{(k-1)}\Bigr),\qquad H_k=\begin{bmatrix}h_{k,1}\\ \vdots\\ h_{k,L}\end{bmatrix}.
+\end{equation}
+Let the control attention have projection matrices $W_Q^C,W_K^C,W_V^C\in\R^{d_x\times d_g}$, and apply the
+same masked, RoPE-based attention construction as in Section~\ref{sec:attention} to $H_k$:
+\begin{equation}
+Q_k^C=H_kW_Q^C,\quad K_k^C=H_kW_K^C,\quad V_k^C=H_kW_V^C,\qquad c_{k,i}^C=C(H_k)_i\in\R^{d_g}.
+\end{equation}
+The same \emph{control-attention module} $C$ is reused among the seven stages of a given block, although
+the attention weights are recomputed at each stage. Control modules of distinct blocks are independent.
+Thus the control at stage $k+1$ may read the effects of stages $1,\dots,k$.
+
+% =====================================================================================================
+\section{Lifting the current hidden state into operational space}
+
+The initial stage state is the communicated hidden:
+\begin{equation}
+x_i^{(0)}=x_i^{+}.
+\end{equation}
+At each stage $k=1,\dots,K$, project its freshly normalized hidden state into the $D$-dimensional
+operational space:
+\begin{equation}
+u_{k,i}=\SiLU(h_{k,i}P_g)\odot(h_{k,i}P_\up)\in\R^{D},
+\end{equation}
+where
+\begin{equation}
+P_g,P_\up\in\R^{d_x\times D},\qquad D=4096.
+\end{equation}
+Both projectors are \emph{shared across all seven stages of the block}. $P_g$ provides a nonlinear gate,
+while $P_\up$ carries a linearly projected content vector. The Hadamard product forms the stage's
+operational representation. Importantly, the lifting is performed again for every stage after the
+previous update has returned to hidden space.
+
+% =====================================================================================================
+\section{Continuous local routing on a six-slot simplex}
+
+Each stage has its own linear router head:
+\begin{equation}
+W_k\in\R^{d_g\times 6},\qquad b_k\in\R^{6}.
+\end{equation}
+From the stage-specific control read, it produces
+\begin{equation}\label{eq:router}
+\pi_{k,i}=\softmax\bigl(c_{k,i}^CW_k+b_k\bigr)\in\Delta^{5}.
+\end{equation}
+The slots are indexed as follows: $j=0$ is the \emph{null identity} (zero deformation), while
+$j=1,\dots,5$ correspond to five operators of the current family's type $f_k$. For $u\in\R^D$, define
+\begin{equation}
+\op_{k,0}(u)=0,\qquad d_{k,i}=\sum_{j=1}^{5}\pi_{k,i,j}\,\op_{k,j}^{(f_k)}(u_{k,i})\in\R^{D}.
+\end{equation}
+The mixture is continuous; there is no Gumbel hard selection in this version. In the idealized boundary
+case $\pi_{k,i,0}=1$, all other coefficients vanish and hence $d_{k,i}=0$ exactly. A finite softmax logit
+vector typically produces strictly positive probabilities, so this identity statement is a property of
+the simplex boundary, not a claim that exact one-hot output is routinely reached during training.
+
+No single global catalogue of all operators is used. Each of the seven stage occurrences owns the
+parameters of its five local operators. In particular, the three $M$ stages in~\eqref{eq:families} are
+independent.
+
+% =====================================================================================================
+\section{Operator families in the lifted space}
+
+Each operator maps $\R^D\to\R^D$ using rank-$r$ learned frames, with $D=4096$ and $r=32$. Unless
+otherwise indicated, operations on intermediate $r$-vectors are elementwise. The subscripts $k,j$ on frame
+matrices are temporarily suppressed for readability, but all frames belong to their \emph{specific stage
+and operator slot}.
+
+\subsection{$F$: free low-rank nonlinear field}
+
+For the five operators of a stage of family $F$, let
+\begin{equation}
+A_j^F,B_j^F,U_j^F\in\R^{D\times r}.
+\end{equation}
+Then
+\begin{equation}
+\boxed{F_j(u)=\bigl[\SiLU(uA_j^F)\odot(uB_j^F)\bigr](U_j^F)^{\T}.}
+\end{equation}
+No fixed internal catalogue of elementary functions is imposed on the five free fields: their diversity
+comes from learned frames. As $t\to0$, $\SiLU(t)=\tfrac12t+O(t^2)$, so the leading local term is
+quadratic:
+\begin{equation}
+F_j(u)=\tfrac12\bigl[(uA_j^F)\odot(uB_j^F)\bigr](U_j^F)^{\T}+O(\|u\|^3).
+\end{equation}
+The documented initialization multiplies the initial $B_j^F$ frame by \texttt{F\_INIT\_GAIN}$\;=6.0$ for
+empirical matching of the deformation magnitude to the other families; this scaling is an initialization
+rule, not an additional runtime operation.
+
+\subsection{$B$: tangent-to-orthogonal bending}
+
+For each bending slot, take
+\begin{equation}
+T_j,N_j\in\R^{D\times r}.
+\end{equation}
+Let $Q_{T_j}$ be an orthonormal basis obtained from the QR factorization of $T_j$. The second frame is
+orthogonalized against the span of $T_j$:
+\begin{equation}
+N_j^{\perp}=N_j-Q_{T_j}\bigl(Q_{T_j}^{\T}N_j\bigr).
+\end{equation}
+The resulting operator is
+\begin{equation}
+\boxed{B_j(u)=\SiLU(uT_j)(N_j^{\perp})^{\T}.}
+\end{equation}
+$N_j^{\perp}$ is not normalized again. If the frame is rank-deficient, the intended projection is onto the
+actual column span of $T_j$; the QR expression above is the documented construction for the frame-based
+implementation.
+
+\subsection{$M$: point-dependent metric-style deformation}
+
+For each metric-family operator, use
+\begin{equation}
+U_j^M,A_j^M\in\R^{D\times r},\qquad
+\boxed{M_j(u)=\bigl[(uU_j^M)\odot\phi_j(uA_j^M)\bigr](U_j^M)^{\T}.}
+\end{equation}
+The five local nonlinearities are
+\begin{equation}
+\begin{aligned}
+&\phi_1(q)=\tanh(q),\qquad &&\phi_2(q)=\operatorname{softsign}(q)=\frac{q}{1+|q|},\\
+&\phi_3(q)=\operatorname{asinh}(q),\qquad &&\phi_4(q)=q\odot\sigma(\beta_{M,4}|q|),\\
+&\phi_5(q)=\SiLU(q).
+\end{aligned}
+\end{equation}
+The subscript on $\beta_{M,4}$ distinguishes this metric-family parameter from the memory-orientation
+scalar $\beta_{\mathrm{mem}}$. The $M$ family is named for its
+learned, point-dependent modifications, but the formulas alone do \emph{not} assert that a
+positive-definite Riemannian metric tensor is explicitly constructed.
+
+\subsection{$V$: oscillatory deformation family}
+
+This family has the same low-rank frame structure as $M$:
+\begin{equation}
+U_j^V,A_j^V\in\R^{D\times r},\qquad
+\boxed{V_j(u)=\bigl[(uU_j^V)\odot\phi_j(uA_j^V)\bigr](U_j^V)^{\T}.}
+\end{equation}
+The five scalar/vector-valued laws are
+\begin{equation}
+\begin{aligned}
+&\phi_1(q)=\tanh(q), &&\phi_2(q)=\operatorname{asinh}(q),\\
+&\phi_3(q)=\sin(\omega\odot q), &&\phi_4(q)=\one-\cos(\nu\odot q),\\
+&\phi_5(q)=c_s\odot\sin(\omega\odot q)+c_c\odot\bigl[\one-\cos(\nu\odot q)\bigr].
+\end{aligned}
+\end{equation}
+The necessary frequency and combination vectors $\omega,\nu,c_s,c_c\in\R^{r}$ are learned wherever the
+associated law uses them. Every oscillatory operator slot has its own applicable parameters; the notation
+above suppresses the slot index.
+
+\subsection{$S$: linear shear family}
+
+For $U_j^S,V_j^S\in\R^{D\times r}$, define
+\begin{equation}
+\boxed{S_j(u)=(uV_j^S)(U_j^S)^{\T}.}
+\end{equation}
+This is a general learned low-rank linear map of the operational vector. The term \emph{shear} is the name of this family in CASC; the learned map is not restricted by the equations to a
+classical volume-preserving shear matrix.
+
+\subsection{Family-dependent return nonlinearity and initialization}
+
+Before being translated back to hidden space, the mixed deformation uses
+\begin{equation}
+\psi_F=\psi_B=\psi_M=\psi_V=\SiLU,\qquad \psi_S=\operatorname{Id}.
+\end{equation}
+The documented frame initialization starts from normal frame entries with variance approximately $1/D$.
+Certain value-contributing frames are initialized with an additional factor $\varepsilon_0=0.02$, so typical initial relative deformation magnitudes are in the
+$10^{-4}$--$10^{-3}$ range. This is an implementation initialization prescription, not a constraint on the
+trained operator norms.
+
+% =====================================================================================================
+\section{Geometric cascade: composition through hidden space}
+
+The crucial structural feature of CASC--NTP is that a deformation is \emph{immediately returned to the
+hidden state} before the next deformation is evaluated. The shared return projector is
+\begin{equation}
+P_\dn\in\R^{D\times d_x},
+\end{equation}
+independent of $P_\up$; the architecture does not require $P_\dn=P_\up^{\T}$.
+
+For every stage $k$ and token position $i$, the complete state transition is
+\begin{align}
+x_i^{(0)}&=x_i^{+},\\
+h_{k,i}&=\rmsn_{d_x}\bigl(x_i^{(k-1)}\bigr),\\
+u_{k,i}&=\SiLU(h_{k,i}P_g)\odot(h_{k,i}P_\up),\\
+c_{k,i}^C&=C(H_k)_i,\\
+\pi_{k,i}&=\softmax\bigl(c_{k,i}^CW_k+b_k\bigr),\\
+d_{k,i}&=\sum_{j=1}^{5}\pi_{k,i,j}\,\op_{k,j}^{(f_k)}(u_{k,i}),\label{eq:mixture}\\
+\Delta x_{k,i}&=\psi_{f_k}(d_{k,i})P_\dn,\\
+&\boxed{x_i^{(k)}=x_i^{(k-1)}+\Delta x_{k,i}.}
+\end{align}
+In these equations, $H_k$ contains the normalized current states of \emph{all} sequence positions, and $C$
+is causally masked. The output of the block is $B_b(x)_i=x_i^{(K)}$. This defines the deterministic
+forward computation of the entire block, conditional on its parameters.
+
+The operative cycle is
+\begin{equation}
+\underbrace{x^{(k-1)}}_{\text{hidden}}\;\longrightarrow\;\underbrace{h_k}_{\text{renormalize}}\;\longrightarrow\;
+\underbrace{u_k}_{\text{lift}}\;\longrightarrow\;\underbrace{d_k}_{\text{routed geometry}}\;\longrightarrow\;
+\underbrace{x^{(k)}}_{\text{return and add}}.
+\end{equation}
+The control computation is evaluated from $h_k$ at the same stage and modulates $d_k$. This is \emph{not}
+a single sum of seven operators applied once to the initial $u$: both $u_k$ and $c_k^C$ change when earlier
+stage updates change the hidden state.
+
+% =====================================================================================================
+\section{Full forward map and autoregressive readout}
+
+Combining the previous sections, the causal language model is
+\begin{equation}
+(y_1,\dots,y_L)\xrightarrow{E}X^{[0]}\xrightarrow{B_1}\cdots\xrightarrow{B_S}X^{[S]}
+\xrightarrow{\rmsn_{d_x}}H^{\mathrm{out}}\xrightarrow{E^{\T}}\Lambda\in\R^{L\times V}.
+\end{equation}
+For each position,
+\begin{align}
+h_i^{\mathrm{out}}&=\rmsn_{d_x}\bigl(x_i^{[S]}\bigr),\\
+\ell_i&=h_i^{\mathrm{out}}E^{\T}\in\R^{V},\\
+p_i(v)&=\frac{\exp\ell_{i,v}}{\sum_{w=0}^{V-1}\exp\ell_{i,w}},\qquad v=0,\dots,V-1.
+\end{align}
+The tied projection uses a \emph{single} trainable $E$ for the token embedding and the readout, rather than
+maintaining independent embedding and output-head matrices.
+
+\subsection{Causality}
+
+Each $x_i^{[S]}$ depends only on tokens at positions at most $i$: the GRU state is causal, both attentions
+use triangular masks, and the geometric operations are pointwise in position once the causal control
+vectors are constructed. Therefore the logits $\ell_i$ define a next-token conditional distribution
+$p_\theta(y_{i+1}\mid y_{\le i})$.
+
+% =====================================================================================================
+\section{The three probability simplices}
+
+The architecture contains three conceptually different normalization mechanisms:
+\begin{center}
+\begin{tabular}{p{0.17\textwidth}p{0.17\textwidth}p{0.56\textwidth}}
+\toprule
+Distribution & Space & Role\\
+\midrule
+$\alpha_i$ & $\Delta^{d_g-1}=\Delta^{511}$ & Coordinate-weight distribution used to structure the signed recurrent memory.\\
+$\rho_{i\cdot}^{A,a}$ and $\rho_{k,i\cdot}^{C,a}$ & $\Delta^{i-1}$ & Distributions over accessible past and current sequence positions for each head.\\
+$\pi_{k,i}$ & $\Delta^{5}$ & Distribution over the null-identity slot and five operators of the current family.\\
+\bottomrule
+\end{tabular}
+\end{center}
+The meanings are not interchangeable: $\alpha$ distributes carrier coordinates, attention weights
+distribute source positions, and $\pi$ distributes stage-level deformation choices.
+
+% =====================================================================================================
+\section{Learning objective and actual optimization mechanism}
+
+This section distinguishes the trainable machine from the optimizer and states \emph{the training
+mechanism documented for CASC--NTP}. The model is trained end-to-end using ordinary next-token
+cross-entropy. For position mask $M_i\in\{0,1\}$,
+\begin{equation}
+\boxed{\mathcal L_{\mathrm{NTP}}(\theta)=-\frac{1}{\sum_iM_i}\sum_iM_i\log p_{\theta,i}(y_{i+1}).}
+\end{equation}
+Here $\theta$ comprises the embedding, recurrent memory, both attention mechanisms, local routing heads,
+operator frames, projectors, and normalization parameters.
+
+\subsection{Standard backward propagation}
+
+Gradients are computed by \textbf{classical backpropagation}, i.e.\ reverse-mode differentiation through
+the full forward computation graph (including attention, recurrent states, stage-wise geometric updates,
+and tied lexical weights). With $z_{i,v}=\ell_{i,v}$ and one-hot target $e_{y_{i+1}}$,
+\begin{equation}
+\frac{\partial\mathcal L_{\mathrm{NTP}}}{\partial z_{i,v}}=\frac{M_i}{\sum_jM_j}\Bigl[p_{\theta,i}(v)-\one\{v=y_{i+1}\}\Bigr].
+\end{equation}
+For any trainable parameter $\theta_a$, the actual update gradient is
+\begin{equation}
+g_{t,a}=\frac{\partial\mathcal L_{\mathrm{NTP}}(\theta_t)}{\partial\theta_a},
+\end{equation}
+obtained via the chain rule throughout the network. In particular, the coefficients $\pi_{k,i,j}$ route
+forward information and receive gradients through \eqref{eq:router}--\eqref{eq:mixture}; they \emph{do not
+replace} reverse-mode derivatives as an optimization rule.
+
+\subsection{AdamW parameter updates}
+
+The documented trainer uses AdamW with $\beta_1=0.9$, $\beta_2=0.95$, decoupled weight decay
+$\lambda=0.01$, and global gradient-norm clipping at $1.0$. For gradient $g_t$ after any prescribed
+clipping, the standard AdamW equations are
+\begin{align}
+m_t&=\beta_1m_{t-1}+(1-\beta_1)g_t,\\
+v_t&=\beta_2v_{t-1}+(1-\beta_2)(g_t\odot g_t),\\
+\hat m_t&=\frac{m_t}{1-\beta_1^t},\qquad \hat v_t=\frac{v_t}{1-\beta_2^t},\\
+\theta_t&=(1-\eta_t\lambda)\theta_{t-1}-\eta_t\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon_{\mathrm{AdamW}}}.
+\end{align}
+These are conventional optimizer equations supplied here to identify the training mechanism;
+$\varepsilon_{\mathrm{AdamW}}$ is the optimizer stabilization constant and is \emph{not} the
+$\varepsilon=10^{-6}$ used in the geometric normalizations. The released trainer uses the PyTorch default $\varepsilon_{\mathrm{AdamW}}=10^{-8}$. The
+learning-rate schedule belongs to the training protocol, not to the mathematical definition of the machine.
+
+The published run, NTP\_A\_4B, used an initial learning rate of $6\times10^{-4}$ after a warmup of 2000
+steps and a warmup--stable--decay schedule with a linear decay over the last 15\% of training. It completed
+49{,}215 optimizer steps over $3.592\times10^{9}$ prediction tokens, one full pass over its corpus. These
+numbers document that run; they are not requirements for constructing or evaluating CASC--NTP.
+
+% =====================================================================================================
+\section{Parameter count and sharing rules}
+
+The full-size configuration has 175{,}218{,}812 trainable parameters, partitioned as follows:
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Component & Trainable parameters\\
+\midrule
+Tied embedding $E$ & 65.536\,M\\
+Causal memory and attention mechanisms & 19.931\,M\\
+Shared within-block operational projectors & 50.332\,M\\
+Geometric operator-family frames & 39.325\,M\\
+Stage routers and normalization scales & 0.095\,M\\
+\midrule
+\textbf{Total} & $\mathbf{175.219}$\,\textbf{M}\\
+\bottomrule
+\end{tabular}
+\end{center}
+The three large projection matrices $P_g,P_\up,P_\dn$ contribute, per block,
+\begin{equation}
+3d_xD=3(1024)(4096)=12{,}582{,}912
+\end{equation}
+weights. Across four blocks, this equals 50{,}331{,}648. The tied embedding has $Vd_x=65{,}536{,}000$
+parameters. Component totals are rounded to three decimal places in millions.
+
+Parameter sharing is precisely localized: the attention $C$ and operational projectors are reused across
+stages of a \emph{single} block; operator-frame parameters and router head parameters are distinct for each
+stage; blocks are separate; and lexical weights are tied between input embedding and final readout.
+
+% =====================================================================================================
+\section{Architectural diagnostics and interpretation}
+
+The trainer logs the following diagnostics per block and geometric stage, without
+treating them as extra losses:
+\begin{equation}
+\pi_{k,i,0},\qquad \exp\mathcal H(\pi_{k,i}),\qquad \frac{\|d_{k,i}\|_2}{\|u_{k,i}\|_2},\qquad
+\frac{\|\Delta x_{k,i}\|_2}{\|x_i^{(k-1)}\|_2}.
+\end{equation}
+For the cumulative dynamics, relevant quantities include
+\begin{equation}
+\cos(\Delta x_{k,i},\Delta x_{\ell,i}),\qquad \frac{\bigl\|\sum_{j\le k}\Delta x_{j,i}\bigr\|_2}{\|x_i^{+}\|_2},\qquad
+\frac{\|u_{k,i}-u_{k-1,i}\|_2}{\|u_{k-1,i}\|_2},\qquad \cos(u_{k,i},u_{k-1,i}),
+\end{equation}
+where cosine similarity is defined when its arguments have nonzero norm, and denominators should be
+numerically safeguarded when these diagnostics are implemented. Percentile-based statistics of
+deformation magnitudes (e.g.\ $r_{90}$ and $r_{99}$ in the training log) and norms of the $F$ family's
+intermediate factors are also useful to identify concentration, cancellation, stage inactivity, or
+uncontrolled initialization growth.
+
+\subsection{Meaning and limits of the geometric vocabulary}
+
+The terms \emph{geometric deformation}, \emph{metric}, \emph{bending}, \emph{shear}, and \emph{manifold}
+describe the architecture's intended interpretation: learned operators move a hidden representation
+through a sequence of locally defined transformations, and each update changes the inputs to the
+subsequent stage. The equations establish this \emph{computational} interpretation. They do not, by
+themselves, prove that the hidden-state data occupy a smooth embedded submanifold, that any learned update
+is a diffeomorphism, that all mappings are invertible, or that the $M$ family defines a positive-definite
+metric. Those would require additional mathematical assumptions and separate verification. In particular,
+the low-rank, gated, residual maps are not constrained here to preserve dimension, distance, topology,
+volume, or curvature in a specified formal sense.
+
+% =====================================================================================================
+\section{Compact specification of the complete machine}
+
+For $b=1,\dots,S$, the block acts as
+\begin{equation}
+\boxed{
+\begin{array}{c}
+\text{recurrent signed-simplex carrier }\Gbar^{(b)}\xrightarrow{A^{(b)}}c^{A,(b)}\;\longrightarrow\;x^{+,(b)},\\[3pt]
+x^{(0,b)}=x^{+,(b)},\\[3pt]
+\left.\begin{aligned}
+h_k^{(b)}&=\rmsn\bigl(x^{(k-1,b)}\bigr),\\
+u_k^{(b)}&=\SiLU\bigl(h_k^{(b)}P_g^{(b)}\bigr)\odot\bigl(h_k^{(b)}P_\up^{(b)}\bigr),\\
+c_k^{C,(b)}&=C^{(b)}\bigl(h_k^{(b)}\bigr),\\
+\pi_k^{(b)}&=\softmax\bigl(c_k^{C,(b)}W_k^{(b)}+b_k^{(b)}\bigr),\\
+d_k^{(b)}&=\textstyle\sum_{j=1}^{5}\pi_{k,j}^{(b)}\,\op_{k,j}^{(f_k,b)}\bigl(u_k^{(b)}\bigr),\\
+x^{(k,b)}&=x^{(k-1,b)}+\psi_{f_k}\bigl(d_k^{(b)}\bigr)P_\dn^{(b)}
+\end{aligned}\right\}\quad k=1,\dots,7.
+\end{array}}
+\end{equation}
+All operations in this display are performed over token positions as described earlier, with causal
+dependencies preserved by the recurrent update and masked attentions. Finally,
+\begin{equation}
+\boxed{
+\begin{aligned}
+X^{[0]}&=E[y_1,\dots,y_L],\\
+X^{[S]}&=B_S\circ\cdots\circ B_1\bigl(X^{[0]}\bigr),\\
+\Lambda&=\rmsn_{d_x}\bigl(X^{[S]}\bigr)E^{\T},\\
+p_\theta(y_{i+1}\mid y_{\le i})&=\softmax(\Lambda_i)_{y_{i+1}},\\
+g_\theta&=\nabla_\theta\mathcal L_{\mathrm{NTP}}\quad\text{(classical backpropagation)},\\
+\theta_{t+1}&=\operatorname{AdamW}(\theta_t,g_\theta).
+\end{aligned}}
+\end{equation}
+
+% =====================================================================================================
+\section*{Verification against the released code}
+\addcontentsline{toc}{section}{Verification against the released code}
+
+The statements of this document were checked against the released source code (\texttt{casc.py},
+\texttt{train.py}) with \texttt{test\_casc.py}:
+\begin{itemize}
+\item tensor shapes and the parameter count: $175{,}218{,}812$ trainable parameters in 274 state-dict
+entries, whose names and shapes are exactly those of the published checkpoint (loaded with
+\texttt{strict=True});
+\item parameter sharing: one control attention $C$ and one projector triplet $(P_g,P_\up,P_\dn)$ per
+block, independent operator frames and router heads for every stage, a single tied matrix $E$;
+\item the equations of Sections~3--10, by independent re-implementation: signed-simplex GRU, causal
+attentions, identity slot, the $F$, $B$, $M$, $V$, $S$ operators, $\psi$ per family, renormalization and
+control recomputed at every stage, causality of the whole machine;
+\item the optimizer: \texttt{torch.optim.AdamW} with $\beta_1=0.9$, $\beta_2=0.95$, $\lambda=0.01$ and the
+PyTorch default $\varepsilon_{\mathrm{AdamW}}=10^{-8}$, global gradient-norm clipping at $1.0$.
+\end{itemize}
+The measurements of the published run are reported in \texttt{report.html}.
+
+\end{document}

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "casc-architecture"
+version = "0.1.0"
+description = "CASC: an autoregressive language model built as a cascade of learned geometric deformations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+classifiers = ["License :: OSI Approved :: GNU General Public License v3 (GPLv3)"]
+dependencies = ["torch>=2.1", "numpy", "tokenizers>=0.15"]
+
+[tool.setuptools]
+py-modules = ["casc", "train", "data", "generate"]

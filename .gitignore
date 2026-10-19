@@ -1,0 +1,30 @@
+# weights (published on Hugging Face) and token streams
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# corpora, runs and logs
+corpus/
+shards/
+run*/
+*.log
+
+# Python, environments, caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# LaTeX build products
+docs/*.aux
+docs/*.out
+docs/*.toc
+
+# editor
+.idea/
+docs/*.log
