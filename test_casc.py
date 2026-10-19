@@ -461,6 +461,34 @@ def test_ddp_cpu():
     return "2 ranks, gloo: training, validation on rank 0, checkpoints, resume"
 
 
+@test
+def test_ddp_nan_guard():
+    if os.environ.get("CASC_DDP") != "1": raise NotTested("set CASC_DDP=1")
+    with tempfile.TemporaryDirectory() as d:
+        corpus = tiny_corpus(d)
+        wrap = os.path.join(d, "nan_on_rank1.py")
+        with open(wrap, "w") as f:
+            f.write("import os, runpy, sys\nif os.environ.get('RANK') == '1':\n    os.environ['FORCE_NAN_AT'] = '3'\n"
+                    "sys.argv = [%r]\nrunpy.run_path(%r, run_name='__main__')\n" % (os.path.join(HERE, "train.py"), os.path.join(HERE, "train.py")))
+        env = dict(os.environ, DATA=corpus, TOKENS="6000", OUT=os.path.join(d, "run"), TAG="nan", OMP_NUM_THREADS="2", **TINY_TRAIN)
+        r = run([sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2", "--master_port=29733", wrap], cwd=d, env=env, timeout=300)
+        log = open(os.path.join(d, "run", "nan.log")).read()
+        assert r.returncode != 0 and os.path.exists(os.path.join(d, "run", "nan.STOP")) and "STOP: perdita non finita a step 3" in log, (r.stderr[-1200:], log[-300:])
+        assert "Connection reset" not in r.stderr and r.stderr.count("exitcode") and "exitcode  : 3" in r.stderr, r.stderr[-1200:]
+    return "non-finite loss on rank 1 only: every rank stops with code 3, rank 0 writes the STOP marker"
+
+
+@test
+def test_ddp_selftest():
+    if os.environ.get("CASC_DDP") != "1": raise NotTested("set CASC_DDP=1")
+    with tempfile.TemporaryDirectory() as d:
+        env = dict(os.environ, SELFTEST="1", OUT=os.path.join(d, "run"), TAG="st", OMP_NUM_THREADS="2")
+        r = run([sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2", "--master_port=29734", os.path.join(HERE, "train.py")], cwd=d, env=env)
+        log = open(os.path.join(d, "run", "st.log")).read() if os.path.exists(os.path.join(d, "run", "st.log")) else ""
+        assert r.returncode == 0 and "FINE st" in log, (r.stderr[-1200:], log[-300:])
+    return "SELFTEST with 2 ranks: rank 0 writes the synthetic corpus, the others wait"
+
+
 def main():
     rows, t0 = [], time.time()
     for fn in TESTS:

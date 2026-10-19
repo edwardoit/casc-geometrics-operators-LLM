@@ -110,10 +110,12 @@ if __name__ == "__main__":
         DATA = os.path.join(OUT, "_selftest_data"); os.makedirs(DATA, exist_ok=True)
         VOCAB, DX, Dop, RANK, S, L, BS = 512, 128, 256, 8, 2, 64, 4
         TOKENS, WARM, VEVERY = 4e4, 5, 20
-        for nm, n in (("train_code", 60000), ("train_noncode", 140000), ("val_code", 8000), ("val_noncode", 8000)):
-            p = os.path.join(DATA, nm + ".bin")
-            if not os.path.exists(p): synth(p, n, VOCAB, hash(nm) % 10**6)
-        json.dump(dict(vocab=VOCAB, eos_id=0, pad_id=1, dtype="uint16"), open(os.path.join(DATA, "meta.json"), "w"))
+        if PRANK == 0:
+            for nm, n in (("train_code", 60000), ("train_noncode", 140000), ("val_code", 8000), ("val_noncode", 8000)):
+                p = os.path.join(DATA, nm + ".bin")
+                if not os.path.exists(p): synth(p, n, VOCAB, hash(nm) % 10**6)
+            json.dump(dict(vocab=VOCAB, eos_id=0, pad_id=1, dtype="uint16"), open(os.path.join(DATA, "meta.json"), "w"))
+        if DDP: dist.barrier()
 
     meta = json.load(open(os.path.join(DATA, "meta.json")))
     assert VOCAB >= int(meta["vocab"]), "VOCAB %d < vocabolario del corpus %s" % (VOCAB, meta["vocab"])
@@ -261,9 +263,9 @@ if __name__ == "__main__":
             z = net(ids, False)[0]
             ce = F.cross_entropy(z[:, :-1].reshape(-1, VOCAB), ids[:, 1:].reshape(-1))
             if int(os.environ.get("FORCE_NAN_AT", "-1")) == step: ce = ce * float("nan")
-            if not torch.isfinite(ce):
-                bad = torch.tensor([1.0], device=ce.device)
-                if DDP: dist.all_reduce(bad)
+            bad = (~torch.isfinite(ce.detach())).float().reshape(1)
+            if DDP: dist.all_reduce(bad)
+            if float(bad) > 0:
                 if PRANK == 0:
                     open(os.path.join(OUT, TAG + ".STOP"), "w").write("perdita non finita a step %d, seen %d\n" % (step, seen))
                     log("STOP: perdita non finita a step %d (%.3fB token). Stato NON salvato; ultimo stato buono in %s"
