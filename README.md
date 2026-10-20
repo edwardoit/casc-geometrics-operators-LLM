@@ -350,7 +350,9 @@ The existing recurrent memory, attention mechanisms, operator ordering, and deco
 Current: learned transformations of individual latent vectors.
 
 Next experiment: projection of latent representations onto a learned manifold, successive manifold deformations, consistent transport of the projected points, and projection back to obtain the final observable.
-
+The proposed extension begins with a fixed orthonormal matrix B₀ ∈ R^(N×K), where B₀ᵀB₀ = I. Its columns span the initial flat manifold (the White Sheet): M₀ = {B₀q | q ∈ R^K}. Each input vector x is projected onto this shared space through p₀ = B₀B₀ᵀx.
+The original CASC sequence Free → Bend → Metric → Metric → Wave → Metric → Shear progressively deforms the White Sheet through learned, context-dependent operators. Starting from f₀(q) = B₀q, each stage applies fₖ₊₁(q) = fₖ(q) + Δₖ(fₖ(q), context), producing the deformed manifold M₇ = {f₇(q) | q ∈ R^K}. Unlike merely updating the columns of B₀, these nonlinear transformations can deform the geometry of the entire manifold.
+The projected input is transported through the same transformations, then mapped back into the hidden representation and decoded into the next-token probability distribution.
 
 
 ## License
