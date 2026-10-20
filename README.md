@@ -35,23 +35,43 @@ a single candidate.
 
 ## Architecture
 
-```
-tokens y_1 .. y_L
-   │  E: 64,000 x 1,024, tied with the readout
-   ▼
-   x ──► block 1 ──► block 2 ──► block 3 ──► block 4 ──► RMSNorm ──► E^T ──► softmax ──► p(y_t+1)
+The whole machine, from tokens to the next-token distribution:
 
-one block (independent parameters in each of the four):
-   G      = signed-simplex GRU over RMSNorm(x) P_G          causal recurrent carrier, d_g = 512
-   x+     = x + A(G) W_O                                    communication attention A, 8 heads x 64, RoPE
-   for k = 1..7, families F B M M V M S, in sequence:
-       h_k   = RMSNorm_u(x^(k-1))                           the stage re-reads the updated hidden state
-       pi_k  = softmax(C(h_k) W_k + b_k)                    control attention C, six slots: identity + 5
-       u_k   = SiLU(h_k P_g) * (h_k P_up)                   lift to D = 4,096
-       d_k   = sum_j pi_kj op_kj(u_k)                       five rank-32 operators of family f_k
-       x^(k) = x^(k-1) + psi(d_k) P_dn                      psi = identity for S, SiLU for F B M V
-   P_g, P_up, P_dn and C are shared by the seven stages of a block; operators and router heads are not.
+```mermaid
+flowchart LR
+    tok["tokens y₁ … y_L"] --> emb["embedding E<br/>64,000 × 1,024"]
+    emb --> b1["block 1"] --> b2["block 2"] --> b3["block 3"] --> b4["block 4"]
+    b4 --> norm["RMSNorm"] --> head["readout Eᵀ<br/>same matrix as the embedding"] --> p["softmax<br/>p(next token)"]
 ```
+
+Inside one block. The hidden state stays at 1,024 dimensions; only the inside of a stage works at 4,096.
+
+```mermaid
+flowchart TD
+    xin(["x · 1,024"]) --> gru["RMSNorm → P_G → signed-simplex GRU<br/>causal memory carrier · 512"]
+    gru --> attA["attention A · 8 heads × 64 · RoPE · causal<br/>W_O: 512 → 1,024"]
+    xin --> addA(("+"))
+    attA --> addA
+    addA --> state(["x · 1,024"])
+    subgraph stage["stage k = 1 … 7 · families F B M M V M S, one after the other"]
+        h["h_k = RMSNorm(x)"] --> attC["attention C on h_k<br/>recomputed at every stage"]
+        attC --> pi["router π_k = softmax(W_k c + b_k)<br/>identity slot + 5 operators"]
+        h --> lift["lift: SiLU(h P_g) ⊙ (h P_up)<br/>1,024 → 4,096"]
+        lift --> ops["d_k = Σ_j π_kj · op_kj(u)<br/>five rank-32 operators of family f_k"]
+        pi --> ops
+        ops --> down["return: ψ(d_k) P_dn<br/>4,096 → 1,024"]
+        down --> add(("+"))
+    end
+    state --> h
+    state --> add
+    add -->|"x ← x + Δx_k, next stage"| state
+    state -->|"after stage 7"| xout(["block output · 1,024"])
+```
+
+Every stage adds its projected deformation to the hidden state, and the next stage lifts, controls and
+deforms the state already changed by the previous ones. `P_g`, `P_up`, `P_dn` and the control attention
+C are shared by the seven stages of a block; operators and router heads belong to one stage. ψ is the
+identity for S and SiLU for F, B, M and V.
 
 | Family | Operator `op_j(u)` |
 |---|---|
@@ -73,6 +93,40 @@ this cross-entropy, with ordinary backpropagation (`loss.backward()`) and AdamW 
 weight decay 0.01, PyTorch default epsilon), global gradient clipping at 1.0 and a warmup, constant,
 linear-decay schedule. The held-out MACRO reported below is the same cross-entropy, measured on text the
 model never trained on.
+
+## Status
+
+| | Status |
+|---|---|
+| CASC, NTP_A_4B | Trained and finished: this repository, the report, the checkpoint on Hugging Face. |
+| micro-CASC | Implemented and tested at small scale; waiting for a compute budget to train it at scale. |
+| CASC on manifold | Next step. |
+
+### Waiting for a budget: micro-CASC
+
+micro-CASC turns the single cascade into a population of small cascades that talk to each other. Every
+node is a full CASC block (`casc.py`) at a reduced width; a message in R^d enters at one node and, at
+each step, a shared router places it on a **simplex over all nodes plus one EOF vertex**. The message is
+sent to every node at once and the node outputs are summed, weighted by the simplex — a dense mixture,
+not a discrete choice. EOF is one more vertex of that same simplex, not a threshold: the fraction of mass
+on EOF leaves the machine and is read into token space by the single output head, while the rest keeps
+circulating. The next-token distribution is the readout of the mass collected across steps. The routing
+is computed per position, so the machine stays causal.
+
+```mermaid
+flowchart LR
+    tok["tokens"] --> IN["IN node<br/>CASC block → message m"]
+    IN --> router{"router<br/>simplex over N nodes + EOF<br/>(per position)"}
+    router -->|"α · (nodes)"| mix["dense mix<br/>m ← Σ_j β_j · node_j(m)<br/>e ← Σ_j β_j · read_j(m)"]
+    mix -->|"next step"| router
+    router -->|"α_EOF · (mass that leaves)"| acc["accumulate<br/>Σ_t ρ_t α_EOF(t) · e_t"]
+    acc --> ET["ET head<br/>→ p(next token)"]
+```
+
+The directory [`micro-casc/`](micro-casc/) holds this communication and the simplex-with-EOF readout in one
+file; the node law is imported from `casc.py`, never duplicated. `python micro-casc/test_micro_casc.py`
+checks that each node is the published CASC block, that the machine is causal, that the EOF mass is
+conserved, and that gradients flow. It is a research prototype: training it at scale is the open item.
 
 ## Repository
 
